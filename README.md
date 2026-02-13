@@ -2,7 +2,7 @@
 
 This project builds a player similarity model that compares **how players play** (process) rather than only what they produce (box scores). It treats each player’s event history as a sequence and learns a **PlayerBERT** model over those event embeddings.
 
-## Model Architecture (Detailed, aligned with `train_event_encoder.ipynb` + `train_playerbert.ipynb`)
+## Model Architecture
 
 ### EventEncoder (token‑level / “word”)
 **Goal:** map a single event + its 360 context into a fixed‑dimensional vector `E_i ∈ R^128`.
