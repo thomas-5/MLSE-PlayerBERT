@@ -97,3 +97,17 @@ Saved weights (example paths used in Colab):
 - PlayerBERT: `models/playerbert_mam.pt`
 - Player embeddings: `models/player_embeddings.pt`
 
+## V2 Encoder Sketch (feature_engineering branch)
+
+This branch now includes a stronger token-level encoder for mapping one event + 360 context to `E_i`:
+
+- **File:** `event_encoder_v2.py`
+- **Trainer scaffold:** `train_event_encoder_v2.py`
+
+### What changed in V2
+
+- **Event-conditioned scene encoding:** an `[EV]` query token fuses event and frame context.
+- **Relational 360 modeling:** freeze-frame players are encoded with relational self-attention and geometric pairwise bias.
+- **Cross-attention fusion:** replaces simple gated mean fusion.
+- **Multi-task SSL pretraining:** masked event-attribute modeling + masked player-token reconstruction + contrastive objective.
+
