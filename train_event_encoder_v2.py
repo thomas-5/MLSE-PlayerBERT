@@ -48,12 +48,44 @@ INCLUDE_SUBSTRINGS = ["bucket"]
 
 
 def iter_json_objects(path: Path) -> Iterable[dict]:
+    """Yield JSON objects from either JSONL or concatenated-JSON files.
+
+    Supports:
+    - Proper JSONL (one object per line)
+    - Concatenated objects with no newline separator: {...}{...}{...}
+    """
+    decoder = json.JSONDecoder()
     with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            yield json.loads(line)
+        buf = ""
+        while True:
+            chunk = f.read(1 << 20)  # 1 MB
+            if not chunk:
+                break
+            buf += chunk
+
+            while True:
+                buf = buf.lstrip()
+                if not buf:
+                    break
+                try:
+                    obj, idx = decoder.raw_decode(buf)
+                except json.JSONDecodeError:
+                    # Need more bytes for a complete object.
+                    break
+                yield obj
+                buf = buf[idx:]
+
+        # Parse any remaining trailing object.
+        buf = buf.lstrip()
+        if buf:
+            obj, idx = decoder.raw_decode(buf)
+            if buf[idx:].strip():
+                raise json.JSONDecodeError(
+                    "Trailing non-JSON content",
+                    buf,
+                    idx,
+                )
+            yield obj
 
 
 def normalize_value(val) -> str:
