@@ -4,35 +4,35 @@ This project builds a player similarity model that compares **how players play**
 
 ## Model Architecture
 
-### EventEncoder (token‑level / “word”)
-**Goal:** map a single event + its 360 context into a fixed‑dimensional vector `E_i ∈ R^128`.
+### EventEncoder V2 (token‑level / “word”)
+**Goal:** map a single event + its 360 context into a fixed‑dimensional vector `E_i ∈ R^128` that captures both the action and the tactical scene around it.
 
 **Inputs**
 - **Event attributes (tabular):** flattened dot‑keys with categorical values and bucketized numerics (e.g., `type.name`, `pass.length_bucket`, `shot.xg_bucket`, `location_bucket.label`).
 - **360 freeze‑frame:** variable‑length list of visible players with locations and teammate/keeper flags.
 
-**Event attribute encoding (EventTransformer)**
+**Event attribute encoding**
 - The dataset is **flattened** (dot‑keys). The training notebook derives `EVENT_FEATURES` directly from the flattened JSONL, excluding IDs and lists.
 - Each event feature is a **token**: `(feature_name, feature_value)`.
 - **Per‑feature vocabularies** are built from the dataset (each feature has its own lookup table).
 - **Value embedding:** `Embedding(|V_f|, d)` for each feature `f`.
 - **Feature embedding:** learned embedding for feature identity.
 - Token representation: `token_f = value_embed_f + feature_embed_f`.
-- All feature tokens go through a **TransformerEncoder** (2 layers, 4 heads by default).
-- The event representation is the **mean** of token outputs: `z_event ∈ R^128`.
+- A learned event query token and the event feature tokens go through a **TransformerEncoder**.
+- The contextualized query token becomes the event summary that conditions scene retrieval.
 
-**360 frame encoding (SetEncoder)**
+**360 scene encoding**
 - Each visible player is converted into a per‑player vector:
   - `dx`, `dy`: relative to event actor
   - `dist`, `angle`
   - `is_teammate`, `is_keeper`
-- A shared **MLP** maps each player vector to an embedding.
-- **Mean pooling** over players yields `z_frame`.
+- Player tokens are projected into a shared space and passed through stacked **relational self-attention** blocks.
+- The relational attention uses **geometric pairwise bias** so players can attend to one another as a structured scene instead of being collapsed by averaging.
 
-**Gated fusion**
-- Combine `z_event` and `z_frame` with a learned gate:
-  - `g = sigmoid(W [z_event ; z_frame])`
-  - `E_i = g ⊙ z_event + (1 − g) ⊙ z_frame`
+**Event-conditioned fusion**
+- The event summary acts as a **query** over the encoded scene/player tokens.
+- Cross-attention produces a scene readout tailored to the event semantics.
+- The final event embedding is built from the event summary plus this conditional scene context.
 
 **Output**
 - `E_i ∈ R^128` for each event.
@@ -74,8 +74,9 @@ This project builds a player similarity model that compares **how players play**
    - Removes unique IDs, fills missing values, bucketizes numeric features,
      drops rare features, and **flattens** event attributes into dot‑keys.
 3. **EventEncoder pretraining**
-   - Notebook: `train_event_encoder.ipynb` (Colab)
-   - Masked Attribute Modeling on event features.
+   - Baseline notebook: `train_event_encoder.ipynb` (Colab)
+   - Current Python trainer: `train_event_encoder_v2.py`
+   - Masked Attribute Modeling on event features, masked player-token reconstruction, and contrastive learning.
 4. **PlayerBERT training**
    - Notebook: `train_playerbert.ipynb` (Colab)
    - Masked Event Modeling on event embeddings.
@@ -97,9 +98,14 @@ Saved weights (example paths used in Colab):
 - PlayerBERT: `models/playerbert_mam.pt`
 - Player embeddings: `models/player_embeddings.pt`
 
-## V2 Encoder Sketch (feature_engineering branch)
+## Baseline vs Current V2
 
-This branch now includes a stronger token-level encoder for mapping one event + 360 context to `E_i`:
+The older notebook-based baseline used:
+- mean pooling over event tokens,
+- mean pooling over freeze-frame players,
+- a static gate to mix the two summaries.
+
+The current V2 encoder in this repo replaces that with a relational, event-conditioned design:
 
 - **File:** `event_encoder_v2.py`
 - **Trainer scaffold:** `train_event_encoder_v2.py`
@@ -108,6 +114,5 @@ This branch now includes a stronger token-level encoder for mapping one event + 
 
 - **Event-conditioned scene encoding:** an `[EV]` query token fuses event and frame context.
 - **Relational 360 modeling:** freeze-frame players are encoded with relational self-attention and geometric pairwise bias.
-- **Cross-attention fusion:** replaces simple gated mean fusion.
+- **Cross-attention fusion:** the event summary queries scene tokens directly instead of using a static gate.
 - **Multi-task SSL pretraining:** masked event-attribute modeling + masked player-token reconstruction + contrastive objective.
-

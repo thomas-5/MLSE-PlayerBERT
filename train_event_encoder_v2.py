@@ -29,6 +29,7 @@ except Exception:  # noqa: BLE001
 
 UNK_TOKEN = "[UNK]"
 MASK_TOKEN = "[MASK]"
+PLAYER_TOKEN_DIM = 8
 
 EXCLUDE_PREFIXES = [
     "id",
@@ -221,7 +222,7 @@ def extract_freeze_frame(ev: dict, max_players: int | None) -> tuple[torch.Tenso
         valid_count = min(valid_count, max_players)
 
     if not players:
-        players = [[0.0] * 8]
+        players = [[0.0] * PLAYER_TOKEN_DIM]
     return torch.tensor(players, dtype=torch.float32), valid_count
 
 
@@ -332,7 +333,14 @@ def jitter_frame_tokens(
 ) -> torch.Tensor:
     jittered = frame_tokens.clone()
     noise = torch.randn_like(jittered[:, :, :2]) * noise_std
-    jittered[:, :, :2] = jittered[:, :, :2] + noise * frame_mask.unsqueeze(-1)
+    dxdy = jittered[:, :, :2] + noise * frame_mask.unsqueeze(-1)
+    jittered[:, :, :2] = dxdy
+
+    dist = torch.linalg.norm(dxdy, dim=-1)
+    angle = torch.atan2(dxdy[:, :, 1], dxdy[:, :, 0] + 1e-8)
+    jittered[:, :, 2] = dist
+    jittered[:, :, 3] = torch.sin(angle)
+    jittered[:, :, 4] = torch.cos(angle)
     return jittered
 
 
@@ -406,7 +414,7 @@ def main() -> None:
     model = EventConditionedSceneEncoder(
         vocab_sizes=vocab_sizes,
         numeric_dim=8,
-        player_dim=8,
+        player_dim=PLAYER_TOKEN_DIM,
         d_model=args.d_model,
         out_dim=args.out_dim,
         event_layers=args.event_layers,
@@ -414,7 +422,7 @@ def main() -> None:
         num_heads=args.num_heads,
     ).to(device)
     mam_head = MaskedFeatureHead(vocab_sizes=vocab_sizes, d_model=args.d_model).to(device)
-    frame_head = FrameReconstructionHead(d_model=args.d_model, player_dim=8).to(device)
+    frame_head = FrameReconstructionHead(d_model=args.d_model, player_dim=PLAYER_TOKEN_DIM).to(device)
 
     optimizer = torch.optim.Adam(
         list(model.parameters()) + list(mam_head.parameters()) + list(frame_head.parameters()),

@@ -92,7 +92,7 @@ class RelationalSelfAttention(nn.Module):
         self.out_proj = nn.Linear(d_model, d_model)
         hidden = max(16, d_model // 8)
         self.rel_bias = nn.Sequential(
-            nn.Linear(4, hidden),
+            nn.Linear(5, hidden),
             nn.GELU(),
             nn.Linear(hidden, 1),
         )
@@ -105,10 +105,11 @@ class RelationalSelfAttention(nn.Module):
         angle = torch.atan2(diff[..., 1], diff[..., 0] + 1e-8)
         rel = torch.stack(
             [
+                diff[..., 0],
+                diff[..., 1],
                 dist,
                 torch.sin(angle),
                 torch.cos(angle),
-                diff[..., 0] * diff[..., 1],
             ],
             dim=-1,
         )
@@ -211,6 +212,8 @@ class FrameGraphEncoder(nn.Module):
         x = x * player_mask.unsqueeze(-1)
 
         coords = player_tokens[..., :2]
+        if mask_positions is not None:
+            coords = coords.masked_fill(mask_positions.unsqueeze(-1), 0.0)
         for layer in self.layers:
             x = layer(x, coords, player_mask)
         return x
@@ -261,8 +264,9 @@ class EventConditionedSceneEncoder(nn.Module):
             dropout=dropout,
         )
         self.frame_mask_token = nn.Parameter(torch.zeros(d_model))
+        self.null_scene_token = nn.Parameter(torch.zeros(1, 1, d_model))
 
-        self.cross_attn = nn.MultiheadAttention(
+        self.scene_cross_attn = nn.MultiheadAttention(
             embed_dim=d_model,
             num_heads=num_heads,
             dropout=dropout,
@@ -309,16 +313,23 @@ class EventConditionedSceneEncoder(nn.Module):
             mask_token=self.frame_mask_token,
         )
 
-        # Event query attends over both encoded event tokens and frame tokens.
-        joint_tokens = torch.cat([event_hidden[:, 1:, :], frame_hidden], dim=1)
-        joint_mask = torch.cat([event_input_mask[:, 1:], frame_mask], dim=1)
+        # The event summary queries only the relational scene tokens.
         query = event_hidden[:, :1, :]
-        cross_out, _ = self.cross_attn(
+        null_scene = self.null_scene_token.expand(batch_size, -1, -1)
+        scene_tokens = torch.cat([null_scene, frame_hidden], dim=1)
+        scene_mask = torch.cat(
+            [
+                torch.ones(batch_size, 1, dtype=torch.bool, device=feat_ids.device),
+                frame_mask,
+            ],
+            dim=1,
+        )
+        cross_out, scene_attn = self.scene_cross_attn(
             query=query,
-            key=joint_tokens,
-            value=joint_tokens,
-            key_padding_mask=~joint_mask,
-            need_weights=False,
+            key=scene_tokens,
+            value=scene_tokens,
+            key_padding_mask=~scene_mask,
+            need_weights=True,
         )
 
         fused = self.final_norm(query + cross_out).squeeze(1)
@@ -331,6 +342,7 @@ class EventConditionedSceneEncoder(nn.Module):
             "feature_tokens": event_hidden[:, 2:, :],  # skip [EV] and numeric token
             "frame_tokens": frame_hidden,
             "query_token": fused,
+            "scene_attention": scene_attn,
         }
 
 
