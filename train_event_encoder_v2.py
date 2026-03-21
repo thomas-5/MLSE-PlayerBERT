@@ -6,6 +6,7 @@ import json
 import math
 import random
 from collections import Counter
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, Iterable, List
 
@@ -366,6 +367,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w_frame", type=float, default=1.0)
     parser.add_argument("--w_ctr", type=float, default=0.2)
     parser.add_argument("--temperature", type=float, default=0.1)
+    parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--amp", action="store_true", help="Use CUDA mixed precision when available")
     return parser.parse_args()
 
 
@@ -403,13 +406,18 @@ def main() -> None:
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=0,
+        num_workers=args.num_workers,
+        pin_memory=torch.cuda.is_available(),
         collate_fn=collate_batch,
     )
     print(f"Loaded rows: {len(dataset)}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+    use_amp = bool(args.amp and device.type == "cuda")
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     model = EventConditionedSceneEncoder(
         vocab_sizes=vocab_sizes,
@@ -442,80 +450,87 @@ def main() -> None:
         epoch_ctr = 0.0
 
         for batch in tqdm(loader, desc=f"Epoch {epoch + 1}/{args.epochs}"):
-            feat_ids = batch["feat_ids"].to(device)
-            numeric = batch["numeric"].to(device)
-            frame_tokens = batch["frame_tokens"].to(device)
-            frame_mask = batch["frame_mask"].to(device)
+            feat_ids = batch["feat_ids"].to(device, non_blocking=True)
+            numeric = batch["numeric"].to(device, non_blocking=True)
+            frame_tokens = batch["frame_tokens"].to(device, non_blocking=True)
+            frame_mask = batch["frame_mask"].to(device, non_blocking=True)
 
-            masked_feat_ids, feature_labels = mask_feature_ids(
-                feat_ids=feat_ids,
-                feature_vocab_sizes=feature_vocab_sizes,
-                mask_prob=args.mask_prob_features,
-            )
-            masked_frame_positions = mask_frame_positions(
-                frame_mask=frame_mask,
-                mask_prob=args.mask_prob_players,
-            )
-
-            out_1 = model(
-                feat_ids=masked_feat_ids,
-                numeric_values=numeric,
-                frame_tokens=frame_tokens,
-                frame_mask=frame_mask,
-                frame_mask_positions=masked_frame_positions,
-            )
-
-            # View 2 with mild geometric jitter for contrastive learning.
-            jittered_frames = jitter_frame_tokens(frame_tokens, frame_mask, noise_std=0.01)
-            out_2 = model(
-                feat_ids=masked_feat_ids,
-                numeric_values=numeric,
-                frame_tokens=jittered_frames,
-                frame_mask=frame_mask,
-                frame_mask_positions=masked_frame_positions,
-            )
-
-            logits = mam_head(out_1["feature_tokens"])
-            mam_loss = 0.0
-            used = 0
-            for i, feature in enumerate(feature_list):
-                target = feature_labels[:, i]
-                if (target != -100).any():
-                    mam_loss = mam_loss + F.cross_entropy(
-                        logits[feature],
-                        target,
-                        ignore_index=-100,
-                    )
-                    used += 1
-            if used > 0:
-                mam_loss = mam_loss / used
-            else:
-                mam_loss = torch.tensor(0.0, device=device)
-
-            frame_pred = frame_head(out_1["frame_tokens"])
-            if masked_frame_positions.any():
-                frame_loss = F.mse_loss(
-                    frame_pred[masked_frame_positions],
-                    frame_tokens[masked_frame_positions],
+            optimizer.zero_grad(set_to_none=True)
+            amp_ctx = torch.cuda.amp.autocast(enabled=use_amp) if use_amp else nullcontext()
+            with amp_ctx:
+                masked_feat_ids, feature_labels = mask_feature_ids(
+                    feat_ids=feat_ids,
+                    feature_vocab_sizes=feature_vocab_sizes,
+                    mask_prob=args.mask_prob_features,
                 )
+                masked_frame_positions = mask_frame_positions(
+                    frame_mask=frame_mask,
+                    mask_prob=args.mask_prob_players,
+                )
+
+                out_1 = model(
+                    feat_ids=masked_feat_ids,
+                    numeric_values=numeric,
+                    frame_tokens=frame_tokens,
+                    frame_mask=frame_mask,
+                    frame_mask_positions=masked_frame_positions,
+                )
+
+                # View 2 with mild geometric jitter for contrastive learning.
+                jittered_frames = jitter_frame_tokens(frame_tokens, frame_mask, noise_std=0.01)
+                out_2 = model(
+                    feat_ids=masked_feat_ids,
+                    numeric_values=numeric,
+                    frame_tokens=jittered_frames,
+                    frame_mask=frame_mask,
+                    frame_mask_positions=masked_frame_positions,
+                )
+
+                logits = mam_head(out_1["feature_tokens"])
+                mam_loss = 0.0
+                used = 0
+                for i, feature in enumerate(feature_list):
+                    target = feature_labels[:, i]
+                    if (target != -100).any():
+                        mam_loss = mam_loss + F.cross_entropy(
+                            logits[feature],
+                            target,
+                            ignore_index=-100,
+                        )
+                        used += 1
+                if used > 0:
+                    mam_loss = mam_loss / used
+                else:
+                    mam_loss = torch.tensor(0.0, device=device)
+
+                frame_pred = frame_head(out_1["frame_tokens"])
+                if masked_frame_positions.any():
+                    frame_loss = F.mse_loss(
+                        frame_pred[masked_frame_positions],
+                        frame_tokens[masked_frame_positions],
+                    )
+                else:
+                    frame_loss = torch.tensor(0.0, device=device)
+
+                ctr_loss = nt_xent_loss(
+                    out_1["projection"],
+                    out_2["projection"],
+                    temperature=args.temperature,
+                )
+
+                total_loss = (
+                    args.w_mam * mam_loss
+                    + args.w_frame * frame_loss
+                    + args.w_ctr * ctr_loss
+                )
+
+            if use_amp:
+                scaler.scale(total_loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
             else:
-                frame_loss = torch.tensor(0.0, device=device)
-
-            ctr_loss = nt_xent_loss(
-                out_1["projection"],
-                out_2["projection"],
-                temperature=args.temperature,
-            )
-
-            total_loss = (
-                args.w_mam * mam_loss
-                + args.w_frame * frame_loss
-                + args.w_ctr * ctr_loss
-            )
-
-            optimizer.zero_grad()
-            total_loss.backward()
-            optimizer.step()
+                total_loss.backward()
+                optimizer.step()
 
             epoch_loss += float(total_loss.item())
             epoch_mam += float(mam_loss.item())
@@ -532,13 +547,17 @@ def main() -> None:
         )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    serializable_args = {
+        key: str(value) if isinstance(value, Path) else value
+        for key, value in vars(args).items()
+    }
     state = {
         "model": model.state_dict(),
         "mam_head": mam_head.state_dict(),
         "frame_head": frame_head.state_dict(),
         "feature_vocab": feature_vocab,
         "features": features,
-        "args": vars(args),
+        "args": serializable_args,
     }
     torch.save(state, args.output)
     print(f"Saved checkpoint to: {args.output.resolve()}")
